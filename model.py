@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
-
+from einops import rearrange
+import math
 
 class ResBlock(nn.Module):
     def __init__(self, in_dim):
@@ -37,7 +38,7 @@ class Discrete_VAE(nn.Module):
         self.hidden_dim = hidden_dim
         self.tau = tau
 
-        self.codebook = nn.Linear(self.num_tokens, self.codebook_dim, bias=False)
+        self.codebook = nn.Embedding(num_tokens, codebook_dim)
 
         encoder_channels = [hidden_dim] * num_layers
         decoder_channels = list(reversed(encoder_channels))
@@ -67,16 +68,28 @@ class Discrete_VAE(nn.Module):
         self.encoder = nn.Sequential(*encoder_layers)
         self.decoder = nn.Sequential(*decoder_layers)
 
+    def decode(self, img_seq):
+        image_embeds = self.codebook(img_seq)
+        b, n, d = image_embeds.shape
+        h = w = int(math.sqrt(n))
+        image_embeds = rearrange(image_embeds, 'b (h w) d -> b d h w', h = h, w = w)
+        images = self.decoder(image_embeds)
+        return images
+
+
     def forward(self, x):
         logits = self.encoder(x).view(-1, self.hidden_dim, self.num_tokens)
         log_qy = F.log_softmax(logits, dim=-1)
         log_uniform = torch.full_like(log_qy, -torch.log(self.num_tokens))
-        kl_div = F.kl_div(log_qy, log_uniform, reduction='batchmean', log_target=True)
+        kld = F.kl_div(log_qy, log_uniform, reduction='batchmean', log_target=True)
 
         if self.training:
             soft_onehot = F.gumbel_softmax(logits, tau=self.tau, dim=-1, hard=False)
         else:
             soft_onehot = F.softmax(logits, dim=-1)
         
-        return self.codebook(soft_onehot.view(-1, self.num_tokends)).view(-1, self.hidden_dim, self.codebook_dim), kl_div
-    
+        sampled = torch.einsum("b n h w, n d -> b d h w", soft_onehot, self.codebook.weight)
+
+        out = self.decoder(sampled)
+
+        return out, kld
